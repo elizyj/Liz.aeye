@@ -1,5 +1,3 @@
-// content.js — Accessibility Assistant (no-layout-touch version)
-
 class AccessibilityAssistant {
   constructor() {
     this.isActive = false;
@@ -26,18 +24,25 @@ class AccessibilityAssistant {
     });
 
     if (!this._listenersBound) {
-      // Listen for messages from popup
+      // Listen for messages from popup (ping/start/stop)
       chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        if (message && typeof message.action === 'string') {
-          if (message.action === 'startAssistant') {
-            // Idempotent start
-            if (!this.isActive) this.startAssistant();
-            sendResponse && sendResponse({ success: true });
-          } else if (message.action === 'stopAssistant') {
-            this.stopAssistant();
-            sendResponse && sendResponse({ success: true });
+        try {
+          if (message && message.type === 'ping') {
+            sendResponse?.({ pong: true });
+            return false; // done
           }
-        }
+
+          if (message && typeof message.action === 'string') {
+            if (message.action === 'startAssistant') {
+              // Idempotent start
+              if (!this.isActive) this.startAssistant();
+              sendResponse?.({ success: true });
+            } else if (message.action === 'stopAssistant') {
+              this.stopAssistant();
+              sendResponse?.({ success: true });
+            }
+          }
+        } catch {}
         // Keep channel open for async responses if needed
         return true;
       });
@@ -124,8 +129,14 @@ class AccessibilityAssistant {
   getFieldLabel(element) {
     // Associated <label for="">
     if (element.id) {
-      const lbl = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
-      if (lbl && lbl.textContent) return lbl.textContent.trim();
+      try {
+        const lbl = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+        if (lbl && lbl.textContent) return lbl.textContent.trim();
+      } catch {
+        // Fallback if CSS.escape not available
+        const lbl = document.querySelector(`label[for="${element.id}"]`);
+        if (lbl && lbl.textContent) return lbl.textContent.trim();
+      }
     }
 
     // aria-label
@@ -269,8 +280,6 @@ class AccessibilityAssistant {
       'Which fields would you like to fill? You can say the numbers, like "field 1", or say the field name. ' +
       'After selecting, I will ask what to enter.'
     );
-
-    // If user immediately says a value without selecting, we’ll prompt again in handleUserInput
   }
 
   handleYesNoResponse(transcript) {
@@ -320,7 +329,7 @@ class AccessibilityAssistant {
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
 
-      // Optional: do not trigger extra focus/blur cycles that can cause layout thrash
+      // Optional: avoid extra focus/blur cycles that can cause layout thrash
       if (typeof el.blur === 'function') {
         try { el.blur(); } catch {}
       }
@@ -341,10 +350,6 @@ class AccessibilityAssistant {
     utterance.volume = this.settings.volume;
     utterance.rate = this.settings.speechRate;
     utterance.lang = 'en-US';
-
-    utterance.onend = () => {
-      // no-op
-    };
 
     try {
       this.speechSynthesis.speak(utterance);
