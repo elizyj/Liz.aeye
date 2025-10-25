@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Accessibility Assistant",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Chrome extension to help lower visibility users navigate and fill forms on websites",
   "permissions": ["activeTab", "storage", "scripting"],
   "host_permissions": ["<all_urls>"],
@@ -12,6 +12,15 @@
     "default_popup": "popup.html",
     "default_title": "Accessibility Assistant"
   },
+  "commands": {
+    "start-assistant": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+I",
+        "mac": "Command+Shift+I"
+      },
+      "description": "Open popup and start the assistant"
+    }
+  },
   "web_accessible_resources": [
     {
       "resources": ["content.js"],
@@ -19,4 +28,3 @@
     }
   ]
 }
-
