@@ -1,3 +1,5 @@
+// content.js — Accessibility Assistant (no-layout-touch version)
+
 class AccessibilityAssistant {
   constructor() {
     this.isActive = false;
@@ -7,42 +9,52 @@ class AccessibilityAssistant {
     this.currentFieldIndex = 0;
     this.selectedFields = [];
     this.settings = { volume: 0.8, speechRate: 1.0 };
-    
-    // Ensure we don't interfere with the page
-    this.isolated = true;
-    
+
+    // Hard guarantee: we never add DOM nodes or styles.
+    this.neverMutateLayout = true;
+
+    // Prevent double-init of listeners inside the same injected file
+    this._listenersBound = false;
+
     this.init();
   }
 
   init() {
-    // Load settings from storage
+    // Load settings from storage (non-blocking)
     chrome.storage.local.get(['volume', 'speechRate'], (result) => {
       this.settings = { ...this.settings, ...result };
     });
 
-    // Listen for messages from popup
-    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      console.log('Content script received message:', message);
-      if (message.action === 'startAssistant') {
-        this.startAssistant();
-        sendResponse({ success: true });
-      } else if (message.action === 'stopAssistant') {
-        this.stopAssistant();
-        sendResponse({ success: true });
-      }
-      return true; // Keep the message channel open for async response
-    });
+    if (!this._listenersBound) {
+      // Listen for messages from popup
+      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (message && typeof message.action === 'string') {
+          if (message.action === 'startAssistant') {
+            // Idempotent start
+            if (!this.isActive) this.startAssistant();
+            sendResponse && sendResponse({ success: true });
+          } else if (message.action === 'stopAssistant') {
+            this.stopAssistant();
+            sendResponse && sendResponse({ success: true });
+          }
+        }
+        // Keep channel open for async responses if needed
+        return true;
+      });
+
+      this._listenersBound = true;
+    }
   }
 
   startAssistant() {
-    console.log('Starting accessibility assistant...');
     this.isActive = true;
     this.updateStatus('Assistant started. Analyzing page...');
-    
-    // Wait a moment for page to fully load
+
+    // Passive, read-only analysis after a short delay
     setTimeout(() => {
+      if (!this.isActive) return;
       this.analyzePage();
-    }, 1000);
+    }, 300);
   }
 
   stopAssistant() {
@@ -54,21 +66,23 @@ class AccessibilityAssistant {
 
   analyzePage() {
     this.updateStatus('Analyzing page content...');
-    
-    // Find form fields
+
+    // Read-only scan for fields (no focus, no writes)
     this.formFields = this.findFormFields();
-    
-    // Speak the initial options
-    this.speak('Welcome to the Accessibility Assistant. I can help you with this webpage in two ways: I can provide a summary of the page content, or I can help you fill in form fields. Would you like a summary or to fill in the blanks?');
-    
-    // Start listening for user response
+
+    // Speak options; still no DOM touches
+    this.speak(
+      'Welcome to the Accessibility Assistant. I can provide a page summary or help fill form fields. Please say "summary" or "fill the form".'
+    );
+
+    // Begin listening
     this.startSpeechRecognition();
   }
 
   extractPageContent() {
-    // Simply get the text content without modifying anything
-    const mainContent = document.querySelector('main') || document.body;
-    return mainContent.innerText || mainContent.textContent || '';
+    // Pure read — textContent avoids layout/style recalculation that innerText can trigger
+    const main = document.querySelector('main') || document.body;
+    return (main && main.textContent) ? main.textContent : '';
   }
 
   findFormFields() {
@@ -89,17 +103,16 @@ class AccessibilityAssistant {
     ];
 
     selectors.forEach(selector => {
-      const elements = document.querySelectorAll(selector);
-      elements.forEach((element, index) => {
-        // Check if element is visible and not disabled
-        if (element.offsetParent !== null && !element.disabled) {
+      document.querySelectorAll(selector).forEach((el, idx) => {
+        // Only consider visible, enabled controls
+        if (el && el.offsetParent !== null && !el.disabled) {
           fields.push({
-            element: element,
-            type: element.type || element.tagName.toLowerCase(),
-            name: element.name || element.id || `field-${index}`,
-            label: this.getFieldLabel(element),
-            placeholder: element.placeholder || '',
-            required: element.required || false
+            element: el,
+            type: el.type || el.tagName.toLowerCase(),
+            name: el.name || el.id || `field-${idx}`,
+            label: this.getFieldLabel(el),
+            placeholder: el.placeholder || '',
+            required: !!el.required
           });
         }
       });
@@ -109,214 +122,253 @@ class AccessibilityAssistant {
   }
 
   getFieldLabel(element) {
-    // Try to find associated label
-    const label = document.querySelector(`label[for="${element.id}"]`);
-    if (label) return label.textContent.trim();
-    
-    // Try aria-label
-    if (element.getAttribute('aria-label')) {
-      return element.getAttribute('aria-label');
+    // Associated <label for="">
+    if (element.id) {
+      const lbl = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+      if (lbl && lbl.textContent) return lbl.textContent.trim();
     }
-    
-    // Try placeholder
-    if (element.placeholder) {
-      return element.placeholder;
-    }
-    
-    // Try name attribute
-    if (element.name) {
-      return element.name.replace(/[-_]/g, ' ');
-    }
-    
+
+    // aria-label
+    const aria = element.getAttribute('aria-label');
+    if (aria) return aria.trim();
+
+    // placeholder
+    if (element.placeholder) return element.placeholder.trim();
+
+    // name
+    if (element.name) return element.name.replace(/[-_]/g, ' ').trim();
+
     return 'Unlabeled field';
   }
 
   startSpeechRecognition() {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+    if (!this.isActive) return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
       this.speak('Speech recognition is not supported in this browser.');
       return;
     }
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    this.speechRecognition = new SpeechRecognition();
-    
-    this.speechRecognition.continuous = false;
-    this.speechRecognition.interimResults = false;
-    this.speechRecognition.lang = 'en-US';
+    // Tear down previous instance if any
+    if (this.speechRecognition) {
+      try { this.speechRecognition.stop(); } catch {}
+      this.speechRecognition = null;
+    }
 
-    this.speechRecognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript.toLowerCase();
-      this.handleUserInput(transcript);
-    };
+    const rec = new SpeechRecognition();
+    rec.continuous = false;
+    rec.interimResults = false;
+    rec.lang = 'en-US';
 
-    this.speechRecognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error);
-      this.speak('Sorry, I didn\'t catch that. Please try again.');
-      this.startSpeechRecognition();
-    };
-
-    this.speechRecognition.onend = () => {
-      if (this.isActive) {
-        this.startSpeechRecognition();
+    rec.onresult = (event) => {
+      try {
+        const transcript = (event.results && event.results[0] && event.results[0][0] && event.results[0][0].transcript) || '';
+        const text = String(transcript || '').toLowerCase().trim();
+        if (!text) {
+          this.speak('Sorry, I didn’t catch that. Please try again.');
+        } else {
+          this.handleUserInput(text);
+        }
+      } catch {
+        this.speak('Sorry, I didn’t catch that. Please try again.');
       }
     };
 
-    this.speechRecognition.start();
+    rec.onerror = () => {
+      if (this.isActive) {
+        this.speak('Sorry, I didn’t catch that. Please try again.');
+      }
+    };
+
+    rec.onend = () => {
+      // Auto-rearm while active
+      if (this.isActive) {
+        // Small delay to avoid tight restart loops
+        setTimeout(() => this.startSpeechRecognition(), 200);
+      }
+    };
+
+    this.speechRecognition = rec;
+    try { rec.start(); } catch {}
   }
 
   stopSpeechRecognition() {
     if (this.speechRecognition) {
-      this.speechRecognition.stop();
+      try { this.speechRecognition.stop(); } catch {}
       this.speechRecognition = null;
     }
   }
 
   handleUserInput(transcript) {
-    console.log('User said:', transcript);
-    
     if (transcript.includes('summary') || transcript.includes('summarize')) {
       this.provideSummary();
-    } else if (transcript.includes('fill') || transcript.includes('blank') || transcript.includes('form')) {
-      this.handleFormFilling();
-    } else if (transcript.includes('yes') || transcript.includes('no')) {
-      this.handleYesNoResponse(transcript);
-    } else if (this.selectedFields.length > 0) {
-      this.handleFieldValue(transcript);
-    } else {
-      this.speak('I didn\'t understand. Please say "summary" for a page summary or "fill in the blanks" to fill form fields.');
+      return;
     }
+
+    if (transcript.includes('fill') || transcript.includes('blank') || transcript.includes('form')) {
+      this.handleFormFilling();
+      return;
+    }
+
+    if (transcript === 'yes' || transcript.startsWith('yes ')) {
+      this.speak('Great! Let’s proceed with filling the form fields.');
+      this.handleFormFilling();
+      return;
+    }
+
+    if (transcript === 'no' || transcript.startsWith('no ')) {
+      this.speak('Okay, let me know if you need help with anything else.');
+      return;
+    }
+
+    // If we are mid-fill and expecting a value for a selected field
+    if (this.selectedFields.length > 0 && this.currentFieldIndex < this.selectedFields.length) {
+      this.handleFieldValue(transcript);
+      return;
+    }
+
+    // Optional: allow selection by saying "field 1" or a label/name
+    const fieldIdxMatch = transcript.match(/\bfield\s*(\d+)\b/);
+    if (fieldIdxMatch) {
+      const idx = parseInt(fieldIdxMatch[1], 10) - 1;
+      if (!Number.isNaN(idx) && idx >= 0 && idx < this.formFields.length) {
+        this.selectedFields = [this.formFields[idx]];
+        this.currentFieldIndex = 0;
+        this.speak(`Selected ${this.formFields[idx].label}. What would you like to enter?`);
+        return;
+      }
+    }
+
+    this.speak('I didn’t understand. Please say "summary" for a page summary or "fill the form" to fill form fields.');
   }
 
   provideSummary() {
     this.updateStatus('Providing page summary...');
     const content = this.extractPageContent();
-    const summary = this.generateSummary(content);
+    const count = content ? content.trim().split(/\s+/).filter(Boolean).length : 0;
+    const summary = `This page has approximately ${count} words of content and ${this.formFields.length} fillable form fields.`;
     this.speak(summary);
-  }
-
-  generateSummary(content) {
-    // Simple summary generation - just count form fields and basic info
-    const wordCount = content.split(/\s+/).length;
-    return `This page has approximately ${wordCount} words of content and ${this.formFields.length} form fields that can be filled.`;
   }
 
   handleFormFilling() {
     if (this.formFields.length === 0) {
-      this.speak('I don\'t see any form fields on this page.');
+      this.speak('I don’t see any form fields on this page.');
       return;
     }
 
     this.updateStatus('Analyzing form fields...');
-    let fieldDescription = `I found ${this.formFields.length} form fields: `;
-    
-    this.formFields.forEach((field, index) => {
-      fieldDescription += `${index + 1}. ${field.label} (${field.type})`;
-      if (field.required) fieldDescription += ' - required';
-      fieldDescription += '. ';
-    });
 
-    fieldDescription += 'Which fields would you like to fill? You can say the numbers or names.';
-    
-    this.speak(fieldDescription);
+    const list = this.formFields.map((f, i) => {
+      const req = f.required ? ' - required' : '';
+      return `${i + 1}. ${f.label} (${f.type})${req}`;
+    }).join('. ');
+
+    this.speak(
+      `I found ${this.formFields.length} form fields: ${list}. ` +
+      'Which fields would you like to fill? You can say the numbers, like "field 1", or say the field name. ' +
+      'After selecting, I will ask what to enter.'
+    );
+
+    // If user immediately says a value without selecting, we’ll prompt again in handleUserInput
   }
 
   handleYesNoResponse(transcript) {
     if (transcript.includes('yes')) {
-      this.speak('Great! Let\'s proceed with filling the form fields.');
+      this.speak('Great! Let’s proceed with filling the form fields.');
       this.handleFormFilling();
     } else {
       this.speak('Okay, let me know if you need help with anything else.');
     }
   }
 
-  handleFieldValue(transcript) {
+  handleFieldValue(valueTranscript) {
+    if (this.currentFieldIndex >= this.selectedFields.length) return;
+
+    const field = this.selectedFields[this.currentFieldIndex];
+    this.fillField(field, valueTranscript);
+    this.currentFieldIndex++;
+
     if (this.currentFieldIndex < this.selectedFields.length) {
-      const field = this.selectedFields[this.currentFieldIndex];
-      this.fillField(field, transcript);
-      this.currentFieldIndex++;
-      
-      if (this.currentFieldIndex < this.selectedFields.length) {
-        const nextField = this.selectedFields[this.currentFieldIndex];
-        this.speak(`Next field: ${nextField.label}. What would you like to enter?`);
-      } else {
-        this.speak('All selected fields have been filled. Is there anything else you need help with?');
-        this.selectedFields = [];
-        this.currentFieldIndex = 0;
-      }
+      const nextField = this.selectedFields[this.currentFieldIndex];
+      this.speak(`Next field: ${nextField.label}. What would you like to enter?`);
+    } else {
+      this.speak('All selected fields have been filled. Is there anything else you need help with?');
+      this.selectedFields = [];
+      this.currentFieldIndex = 0;
     }
   }
 
   fillField(field, value) {
     try {
-      const element = field.element;
-      
-      // Check if element still exists and is visible
-      if (!element || !element.offsetParent) {
-        this.speak(`Sorry, the ${field.label} field is no longer available.`);
+      const el = field.element;
+      // Verify it still exists and is actionable
+      if (!el || !el.isConnected || el.disabled || el.offsetParent === null) {
+        this.speak(`Sorry, the ${field.label} field is not available.`);
         return;
       }
-      
-      // Focus the element
-      element.focus();
-      
-      // Set the value
-      element.value = value;
-      
-      // Trigger events to notify the website of the change
-      const inputEvent = new Event('input', { bubbles: true, cancelable: true });
-      const changeEvent = new Event('change', { bubbles: true, cancelable: true });
-      
-      element.dispatchEvent(inputEvent);
-      element.dispatchEvent(changeEvent);
-      
-      // For React and other frameworks, also trigger focus and blur
-      element.dispatchEvent(new Event('focus', { bubbles: true }));
-      element.dispatchEvent(new Event('blur', { bubbles: true }));
-      
-      this.speak(`Filled ${field.label} with ${value}`);
-    } catch (error) {
-      console.error('Error filling field:', error);
-      this.speak(`Sorry, I couldn't fill the ${field.label} field.`);
+
+      // Only at this moment do we touch focus/value (prevent page jumps)
+      if (typeof el.focus === 'function') {
+        try { el.focus({ preventScroll: true }); } catch { try { el.focus(); } catch {} }
+      }
+
+      // Set value (do not modify attributes or styles that might affect layout)
+      el.value = value;
+
+      // Dispatch standard events so frameworks notice
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Optional: do not trigger extra focus/blur cycles that can cause layout thrash
+      if (typeof el.blur === 'function') {
+        try { el.blur(); } catch {}
+      }
+
+      this.speak(`Filled ${field.label} with ${value}.`);
+    } catch (err) {
+      console.error('Error filling field:', err);
+      this.speak(`Sorry, I couldn’t fill the ${field.label} field.`);
     }
   }
 
   speak(text) {
     if (!this.isActive) return;
-    
+
     this.stopSpeechSynthesis();
-    
+
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.volume = this.settings.volume;
     utterance.rate = this.settings.speechRate;
     utterance.lang = 'en-US';
-    
+
     utterance.onend = () => {
-      console.log('Speech completed');
+      // no-op
     };
-    
-    this.speechSynthesis.speak(utterance);
+
+    try {
+      this.speechSynthesis.speak(utterance);
+    } catch {
+      // swallow TTS errors silently
+    }
   }
 
   stopSpeechSynthesis() {
-    this.speechSynthesis.cancel();
+    try { this.speechSynthesis.cancel(); } catch {}
   }
 
   updateStatus(message) {
-    chrome.runtime.sendMessage({
-      type: 'statusUpdate',
-      text: message
-    });
+    try {
+      chrome.runtime.sendMessage({ type: 'statusUpdate', text: message });
+    } catch {
+      // ignore cross-context errors
+    }
   }
 }
 
-// Initialize the assistant when the page loads
-// Prevent multiple instances
-if (!window.accessibilityAssistant) {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      window.accessibilityAssistant = new AccessibilityAssistant();
-    });
-  } else {
+// Single-instance guard without DOM mutations
+(function bootstrap() {
+  if (!window.accessibilityAssistant) {
     window.accessibilityAssistant = new AccessibilityAssistant();
   }
-}
+})();
