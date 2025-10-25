@@ -15,6 +15,21 @@ document.addEventListener('DOMContentLoaded', function() {
   startBtn.addEventListener('click', async () => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      
+      // First, inject the content script if it's not already there
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content.js']
+        });
+      } catch (injectError) {
+        console.log('Content script already injected or error:', injectError);
+      }
+      
+      // Wait a moment for the script to initialize
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Now try to send the message
       await chrome.tabs.sendMessage(tab.id, { action: 'startAssistant' });
       isActive = true;
       status.textContent = 'Assistant is active';
@@ -22,13 +37,21 @@ document.addEventListener('DOMContentLoaded', function() {
       stopBtn.disabled = false;
     } catch (error) {
       status.textContent = 'Error starting assistant: ' + error.message;
+      console.error('Start assistant error:', error);
     }
   });
 
   stopBtn.addEventListener('click', async () => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      await chrome.tabs.sendMessage(tab.id, { action: 'stopAssistant' });
+      
+      // Try to send the message, but don't fail if content script isn't there
+      try {
+        await chrome.tabs.sendMessage(tab.id, { action: 'stopAssistant' });
+      } catch (messageError) {
+        console.log('Could not send stop message:', messageError);
+      }
+      
       isActive = false;
       status.textContent = 'Assistant stopped';
       startBtn.disabled = false;
@@ -36,6 +59,7 @@ document.addEventListener('DOMContentLoaded', function() {
       currentAction.textContent = '';
     } catch (error) {
       status.textContent = 'Error stopping assistant: ' + error.message;
+      console.error('Stop assistant error:', error);
     }
   });
 

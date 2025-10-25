@@ -8,6 +8,9 @@ class AccessibilityAssistant {
     this.selectedFields = [];
     this.settings = { volume: 0.8, speechRate: 1.0 };
     
+    // Ensure we don't interfere with the page
+    this.isolated = true;
+    
     this.init();
   }
 
@@ -19,15 +22,20 @@ class AccessibilityAssistant {
 
     // Listen for messages from popup
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      console.log('Content script received message:', message);
       if (message.action === 'startAssistant') {
         this.startAssistant();
+        sendResponse({ success: true });
       } else if (message.action === 'stopAssistant') {
         this.stopAssistant();
+        sendResponse({ success: true });
       }
+      return true; // Keep the message channel open for async response
     });
   }
 
   startAssistant() {
+    console.log('Starting accessibility assistant...');
     this.isActive = true;
     this.updateStatus('Assistant started. Analyzing page...');
     
@@ -47,9 +55,6 @@ class AccessibilityAssistant {
   analyzePage() {
     this.updateStatus('Analyzing page content...');
     
-    // Extract page content
-    const pageContent = this.extractPageContent();
-    
     // Find form fields
     this.formFields = this.findFormFields();
     
@@ -61,11 +66,7 @@ class AccessibilityAssistant {
   }
 
   extractPageContent() {
-    // Remove script and style elements
-    const scripts = document.querySelectorAll('script, style, nav, header, footer');
-    scripts.forEach(el => el.remove());
-    
-    // Get main content
+    // Simply get the text content without modifying anything
     const mainContent = document.querySelector('main') || document.body;
     return mainContent.innerText || mainContent.textContent || '';
   }
@@ -90,7 +91,8 @@ class AccessibilityAssistant {
     selectors.forEach(selector => {
       const elements = document.querySelectorAll(selector);
       elements.forEach((element, index) => {
-        if (element.offsetParent !== null) { // Check if element is visible
+        // Check if element is visible and not disabled
+        if (element.offsetParent !== null && !element.disabled) {
           fields.push({
             element: element,
             type: element.type || element.tagName.toLowerCase(),
@@ -193,10 +195,9 @@ class AccessibilityAssistant {
   }
 
   generateSummary(content) {
-    // Simple summary generation - in a real app, you might use AI
-    const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 20);
-    const summary = sentences.slice(0, 5).join('. ');
-    return `This page contains: ${summary}. The page has ${this.formFields.length} form fields that can be filled.`;
+    // Simple summary generation - just count form fields and basic info
+    const wordCount = content.split(/\s+/).length;
+    return `This page has approximately ${wordCount} words of content and ${this.formFields.length} form fields that can be filled.`;
   }
 
   handleFormFilling() {
@@ -248,12 +249,29 @@ class AccessibilityAssistant {
   fillField(field, value) {
     try {
       const element = field.element;
+      
+      // Check if element still exists and is visible
+      if (!element || !element.offsetParent) {
+        this.speak(`Sorry, the ${field.label} field is no longer available.`);
+        return;
+      }
+      
+      // Focus the element
       element.focus();
+      
+      // Set the value
       element.value = value;
       
-      // Trigger change event
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
+      // Trigger events to notify the website of the change
+      const inputEvent = new Event('input', { bubbles: true, cancelable: true });
+      const changeEvent = new Event('change', { bubbles: true, cancelable: true });
+      
+      element.dispatchEvent(inputEvent);
+      element.dispatchEvent(changeEvent);
+      
+      // For React and other frameworks, also trigger focus and blur
+      element.dispatchEvent(new Event('focus', { bubbles: true }));
+      element.dispatchEvent(new Event('blur', { bubbles: true }));
       
       this.speak(`Filled ${field.label} with ${value}`);
     } catch (error) {
@@ -292,10 +310,13 @@ class AccessibilityAssistant {
 }
 
 // Initialize the assistant when the page loads
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
+// Prevent multiple instances
+if (!window.accessibilityAssistant) {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      window.accessibilityAssistant = new AccessibilityAssistant();
+    });
+  } else {
     window.accessibilityAssistant = new AccessibilityAssistant();
-  });
-} else {
-  window.accessibilityAssistant = new AccessibilityAssistant();
+  }
 }
