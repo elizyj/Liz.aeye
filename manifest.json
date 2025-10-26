@@ -1,10 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Accessibility Assistant",
-  "version": "1.1",
-  "description": "Chrome extension to help lower visibility users navigate and fill forms on websites",
-  "permissions": ["activeTab", "storage", "scripting"],
-  "host_permissions": ["<all_urls>"],
+  "version": "1.4.0",
+  "description": "Audio assistant for low-vision users: summarize pages and help fill forms.",
+  "permissions": ["activeTab", "storage", "scripting", "commands"],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "file://*/*",
+    "https://api.openai.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
@@ -18,9 +23,18 @@
         "default": "Ctrl+Shift+I",
         "mac": "Command+Shift+I"
       },
-      "description": "Open popup and start the assistant"
+      "description": "Start the accessibility assistant"
     }
   },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*", "file://*/*"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    }
+  ],
   "web_accessible_resources": [
     {
       "resources": ["content.js"],
