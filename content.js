@@ -254,13 +254,58 @@ class AccessibilityAssistant {
     this.speak('I didn’t understand. Please say "summary" for a page summary or "fill the form" to fill form fields.');
   }
 
-  provideSummary() {
-    this.updateStatus('Providing page summary...');
+provideSummary() {
+  this.updateStatus('Providing detailed page summary...');
+
+  try {
+    const hostname = window.location.hostname || 'this website';
+    const title = document.title || '';
     const content = this.extractPageContent();
-    const count = content ? content.trim().split(/\s+/).filter(Boolean).length : 0;
-    const summary = `This page has approximately ${count} words of content and ${this.formFields.length} fillable form fields.`;
+
+    const wordCount = content ? content.trim().split(/\s+/).filter(Boolean).length : 0;
+
+    // Basic heuristic description
+    let description = 'This page contains general content.';
+    const lc = content.toLowerCase();
+
+    if (lc.includes('login') || lc.includes('sign in')) {
+      description = 'This looks like a login or authentication page.';
+    } else if (lc.includes('register') || lc.includes('sign up')) {
+      description = 'This appears to be a registration or sign-up page.';
+    } else if (lc.includes('checkout') || lc.includes('cart')) {
+      description = 'This seems to be a shopping or checkout page.';
+    } else if (lc.includes('contact')) {
+      description = 'This page likely provides contact or support information.';
+    } else if (lc.includes('about')) {
+      description = 'This appears to be an “About” or information page.';
+    } else if (lc.includes('article') || lc.includes('blog')) {
+      description = 'This seems to be an article or blog post.';
+    } else if (lc.includes('search results')) {
+      description = 'This page shows search results.';
+    } else if (lc.includes('dashboard')) {
+      description = 'This looks like a user dashboard or account overview.';
+    }
+
+    const fieldCount = this.formFields.length;
+    const fieldPhrase =
+      fieldCount === 0 ? 'no fillable form fields'
+      : fieldCount === 1 ? '1 fillable form field'
+      : `${fieldCount} fillable form fields`;
+
+    const summary = `
+      You are on ${hostname}. 
+      The page title is "${title}". 
+      ${description} 
+      It contains approximately ${wordCount} words and ${fieldPhrase}.
+    `;
+
     this.speak(summary);
+  } catch (err) {
+    console.error('Error providing summary:', err);
+    this.speak('Sorry, I was unable to summarize this page.');
   }
+}
+
 
   handleFormFilling() {
     if (this.formFields.length === 0) {
