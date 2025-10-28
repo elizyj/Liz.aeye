@@ -1,8 +1,11 @@
-// content.js — LLM summary + generic fillable detector (deep: shadow DOM + iframes)
+// content.js — Accessibility Assistant
+// Overview + Fill-in-the-blanks with *no hardcoded domains*
+// - Builds page/field context and asks LLM to rewrite labels naturally
+// - Fallback: generic contextualizer (no domain maps)
+// - TTS queue ensures: "count" → numbered list → prompt
 
-// ===== Idempotency guard (prevents “already been declared”) =====
+// ===== Idempotency guard =====
 if (window.__AA_LOADED__) {
-  // If this frame already has our assistant, answer pings and exit.
   chrome.runtime?.onMessage?.addListener?.((m, s, send) => {
     if (m?.type === 'ping') { send?.({ pong: true }); return true; }
     return false;
@@ -11,22 +14,60 @@ if (window.__AA_LOADED__) {
   window.__AA_LOADED__ = true;
   console.log('[AA] content.js LOADED — top frame?', window.top === window, 'url:', location.href);
 
-
   class AccessibilityAssistant {
     constructor() {
       this.isActive = false;
-      this.speechRecognition = null;
+      this.rec = null;
       this.speechSynthesis = window.speechSynthesis;
 
+      // Field discovery & flow state
       this.formFields = [];
       this.currentFieldIndex = 0;
       this.selectedFields = [];
 
+      // Settings
       this.settings = { volume: 0.8, speechRate: 1.0 };
       this._listenersBound = false;
 
+      // TTS queue
+      this.ttsQueue = [];
+      this.ttsBusy = false;
+
       this.init();
     }
+
+    // ======= TTS queue (guarantee ordering) =======
+    queueSpeak(text) {
+      if (!text) return;
+      this.ttsQueue.push(String(text));
+      if (!this.ttsBusy) this._dequeueSpeak();
+    }
+    _dequeueSpeak() {
+      if (!this.isActive) { this.ttsQueue = []; this.ttsBusy = false; return; }
+      const next = this.ttsQueue.shift();
+      if (!next) { this.ttsBusy = false; return; }
+      this.ttsBusy = true;
+
+      // Stop any ongoing utterance
+      try { this.speechSynthesis.cancel(); } catch {}
+
+      const u = new SpeechSynthesisUtterance(next);
+      u.volume = this.settings.volume;
+      u.rate   = this.settings.speechRate;
+      u.lang   = 'en-US';
+      u.onend  = () => { this.ttsBusy = false; this._dequeueSpeak(); };
+      u.onerror= () => { this.ttsBusy = false; this._dequeueSpeak(); };
+      try { this.speechSynthesis.speak(u); } catch { this.ttsBusy = false; }
+    }
+    speakNow(text) { // bypass queue
+      try { this.speechSynthesis.cancel(); } catch {}
+      const u = new SpeechSynthesisUtterance(text);
+      u.volume = this.settings.volume;
+      u.rate   = this.settings.speechRate;
+      u.lang   = 'en-US';
+      try { this.speechSynthesis.speak(u); } catch {}
+    }
+    stopSpeechSynthesis() { try { this.speechSynthesis.cancel(); } catch {} }
 
     init() {
       chrome.storage.local.get(['volume', 'speechRate'], (result) => {
@@ -35,7 +76,6 @@ if (window.__AA_LOADED__) {
 
       if (!this._listenersBound) {
         chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-          // Always respond to pings
           if (message?.type === 'ping') { sendResponse?.({ pong: true }); return true; }
 
           if (typeof message?.action === 'string') {
@@ -59,7 +99,7 @@ if (window.__AA_LOADED__) {
         this._listenersBound = true;
       }
 
-      console.log('[AA] content.js loaded in frame. Top frame?', window.top === window);
+      console.log('[AA] content.js initialized. Top frame?', window.top === window);
     }
 
     // ===== Life cycle =====
@@ -76,37 +116,156 @@ if (window.__AA_LOADED__) {
       this.isActive = false;
       this.stopSpeechRecognition();
       this.stopSpeechSynthesis();
+      this.ttsQueue = [];
+      this.ttsBusy = false;
       this.updateStatus('Assistant stopped');
     }
 
     analyzePage() {
       this.updateStatus('Scanning for interactive elements...');
       this.formFields = this.findFillables();
-      this.speak('Welcome to the Accessibility Assistant. I can summarize the page or help fill blanks. Say "summary" or "fill the form".');
+      this.queueSpeak('Welcome to the Accessibility Assistant. Say "summary" for a page overview, or say "fill the form" to list blanks and start filling.');
       this.startSpeechRecognition();
     }
 
-    // ===== Summarization =====
-    async provideSummaryLLM() {
-      this.updateStatus('Preparing summary...');
+    // ===== Page Overview (LLM, neutral) =====
+    async providePageOverview() {
+      this.updateStatus('Preparing page overview...');
       try {
         const payload = this.collectSummarizationPayload();
-        const result = await chrome.runtime.sendMessage({ type: 'summarizePage', payload });
+        const result = await chrome.runtime.sendMessage({ type: 'summarizePage', payload, mode: 'overview' });
         if (result?.ok && result.summary) {
-          this.speak(result.summary);
+          this.queueSpeak(result.summary);
         } else {
-          if (result?.error) {
-            console.warn('LLM summary error:', result.error);
-            this.updateStatus('LLM summary error: ' + result.error);
-          }
-          this.speak(this.heuristicSummary(payload));
+          const fallback = this.heuristicOverview(payload);
+          this.queueSpeak(fallback);
         }
-      } catch (err) {
-        console.error('Summary error:', err);
-        this.speak(this.heuristicSummary(this.collectSummarizationPayload()));
+      } catch {
+        const payload = this.collectSummarizationPayload();
+        const fallback = this.heuristicOverview(payload);
+        this.queueSpeak(fallback);
       }
     }
 
+    heuristicOverview(payload) {
+      const { title, text } = payload;
+      const words = (text || '').split(/\s+/).filter(Boolean).length;
+      return `This page is titled ${title || 'Untitled'}. It contains approximately ${words} words of content.`;
+    }
+
+    // ===== Fill-in-the-blanks flow =====
+    async runFillInTheBlanksFlow() {
+      // Re-scan to catch dynamic UIs
+      this.formFields = this.findFillables();
+
+      if (this.formFields.length === 0) {
+        this.queueSpeak('I don’t see any fillable fields on this page.');
+        return;
+      }
+
+      // Keep DOM order; user can pick any index. (No domain hardcoding.)
+      const count = this.formFields.length;
+      this.queueSpeak(`I found ${count} fillable ${count === 1 ? 'item' : 'items'}.`);
+
+      // Try LLM natural list first (context-aware), then fall back to generic contextualizer
+      const ok = await this.provideFillablesListLLM();
+      if (!ok) this.readOutLocalFillablesListWithContext();
+
+      // Follow-up prompt
+      this.queueSpeak('Say a number like "field 1", or say a field name to select. You can say repeat, skip, back, or cancel during entry.');
+    }
+
+    async provideFillablesListLLM() {
+      try {
+        const ctx = this.buildFillableContext();
+        const payload = this.collectSummarizationPayload();
+        payload.fillableLabels = ctx.fields.map(f => f.label || f.placeholder || f.name || 'Unlabeled');
+        payload.fillableContext = ctx;
+        // Light cache signature so background can cache per page/form quickly
+        payload.cacheSig = payload.fillableLabels.join('|').slice(0, 400);
+
+        const result = await chrome.runtime.sendMessage({
+          type: 'summarizePage',
+          payload,
+          mode: 'fillables'
+        });
+
+        if (result?.ok && result.summary) {
+          // Expect a numbered list; read as-is.
+          this.queueSpeak(result.summary);
+          return true;
+        }
+        return false;
+      } catch (e) {
+        console.warn('[AA] LLM fillables failed:', e);
+        return false;
+      }
+    }
+
+    // Generic fallback: derive a page keyword and compose “<Label> of <Keyword>”
+    readOutLocalFillablesListWithContext() {
+      const { title, headings, urlHints, globalKeywords } = this.buildFillableContext();
+      const ctxWord = this.pickContextKeyword({ title, headings, urlHints, globalKeywords });
+
+      const items = this.formFields.slice(0, 20).map((f, i) => {
+        const raw = (f.label || f.placeholder || f.name || 'Field').trim();
+        const natural = this.contextualizeLabelGeneric(raw, ctxWord);
+        return `${i + 1}. ${natural}`;
+      });
+      const tail = this.formFields.length > 20 ? `...and ${this.formFields.length - 20} more.` : '';
+      this.queueSpeak(`${items.join('. ')}. ${tail}`.trim());
+    }
+
+    // Very light “context keyword” picker: grabs most distinctive word from title/headings/URL
+    pickContextKeyword({ title = '', headings = [], urlHints = '', globalKeywords = '' }) {
+      const txt = `${title}\n${(headings || []).join(' ')}\n${urlHints}\n${globalKeywords}`.toLowerCase();
+
+      // Remove stopwords and short tokens
+      const stop = new Set('the of and a an to for in on at by with from your my our their his her its be is are was were will can should must not no yes or if as this that these those you me we they it page form'.split(' '));
+      const tokens = txt.split(/[^a-z0-9]+/).filter(w => w && w.length > 2 && !stop.has(w));
+
+      if (!tokens.length) return '';
+
+      // Score by frequency and informativeness (prefer words that also appear in multiple headings segments)
+      const freq = new Map();
+      for (const w of tokens) freq.set(w, (freq.get(w) || 0) + 1);
+
+      // Prefer compound hints first (e.g., "travel", "booking", "checkout", "profile", "shipment", etc.)
+      // but without hardcoding specific domains: just pick the highest-frequency word.
+      let best = '';
+      let bestScore = 0;
+      for (const [w, c] of freq.entries()) {
+        const score = c; // could be extended to TF-IDF-ish, but keep generic
+        if (score > bestScore) { bestScore = score; best = w; }
+      }
+      return best;
+    }
+
+    // Compose natural phrase without domain maps.
+    // Rules:
+    // - If label already contains the context word, just title-case the label.
+    // - Else if label looks like a bare noun (1–2 words), say "<TitleCase(label)> of <context>".
+    // - Else, clean and title-case.
+    contextualizeLabelGeneric(label, ctxWord) {
+      let base = label.replace(/\s+/g, ' ').replace(/[_\-]/g, ' ').trim();
+      const clean = base.replace(/[^\p{L}\p{N}\s]/gu, '').toLowerCase();
+
+      const titleCase = (s) => s.replace(/\b\w/g, m => m.toUpperCase());
+      const alreadyHasCtx = ctxWord && clean.includes(ctxWord.toLowerCase());
+
+      // heuristics: 1–2 tokens → likely a bare noun
+      const tok = clean.split(/\s+/).filter(Boolean);
+      if (alreadyHasCtx) return titleCase(clean);
+
+      if (ctxWord && tok.length <= 2) {
+        // Prefer “Where to?” if label looks like destination-ish purely by interrogative cue words present;
+        // but to avoid hardcoding, keep it generic: "<Label> of <Context>"
+        return titleCase(`${clean} of ${ctxWord}`);
+      }
+      return titleCase(clean);
+    }
+
+    // ===== Summarization payload builder =====
     collectSummarizationPayload() {
       const title = document.title || '';
       const url = location.href;
@@ -132,6 +291,36 @@ if (window.__AA_LOADED__) {
       return { url, title, headings, interactiveCounts, landmarks, text };
     }
 
+    // A richer context object specifically for fillables (no hardcoded domains)
+    buildFillableContext() {
+      const title = document.title || '';
+      const headings = Array.from(document.querySelectorAll('h1,h2,h3')).slice(0, 12).map(h => h.textContent.trim()).filter(Boolean);
+      const urlHints = [location.hostname, location.pathname].join(' ').replace(/[\/\-_]+/g, ' ');
+
+      // collect field hints (labels/placeholders/nearby text)
+      const fields = this.formFields.map(f => {
+        const el = f.element;
+        const ariaLabel = el?.getAttribute?.('aria-label') || '';
+        const placeholder = el?.getAttribute?.('placeholder') || f.placeholder || '';
+        const name = el?.getAttribute?.('name') || f.name || '';
+        const group = el?.closest?.('fieldset, [role="group"], .form-group, .field, form')?.querySelector?.('legend, h1, h2, h3, [aria-label]')?.textContent?.trim() || '';
+        const nearby = el?.closest?.('.form-group, .field, .row, .input, .form-item, label')?.textContent?.trim()?.slice(0, 140) || '';
+        return {
+          label: f.label || '',
+          placeholder,
+          name,
+          ariaLabel,
+          group,
+          nearby
+        };
+      });
+
+      // “Global keywords” = frequent nouns-ish tokens (very light)
+      const globalKeywords = this.pickContextKeyword({ title, headings, urlHints, globalKeywords: '' });
+
+      return { title, headings, urlHints, globalKeywords, fields };
+    }
+
     extractVisibleText(root) {
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode: (node) => {
@@ -153,18 +342,6 @@ if (window.__AA_LOADED__) {
       return parts.join('\n').replace(/\n{3,}/g, '\n\n').slice(0, 200000);
     }
 
-    heuristicSummary(payload) {
-      const { title, headings, interactiveCounts, text } = payload;
-      const words = (text || '').split(/\s+/).filter(Boolean).length;
-      return [
-        `Page title: ${title || 'Untitled'}.`,
-        headings?.length ? `Top headings: ${headings.slice(0,5).join(' · ')}.` : '',
-        `Interactive: ${interactiveCounts.inputs} fields, ${interactiveCounts.buttons} buttons, ${interactiveCounts.links} links.`,
-        `Approximate length: ${words} words.`,
-        `Say "fill the form" to hear the blanks I found.`
-      ].filter(Boolean).join(' ');
-    }
-
     // ===== Deep DOM helpers (shadow DOM + same-origin iframes) =====
     getCandidateRoots() {
       const roots = [document];
@@ -178,46 +355,34 @@ if (window.__AA_LOADED__) {
     }
 
     *iterAllElementsDeep(root) {
-  // Non-recursive traversal that works for Document + ShadowRoot
-  const stack = [root];
-  while (stack.length) {
-    const r = stack.pop();
+      const stack = [root];
+      while (stack.length) {
+        const r = stack.pop();
+        const doc = (r && r.ownerDocument) ? r.ownerDocument
+          : (r && r.nodeType === 9) ? r
+          : document;
 
-    // createTreeWalker is on Document, not ShadowRoot/DocumentFragment
-    const doc = (r && r.ownerDocument) ? r.ownerDocument
-              : (r && r.nodeType === 9) ? r       // if r is a Document
-              : document;
+        let tw;
+        try { tw = doc.createTreeWalker(r, NodeFilter.SHOW_ELEMENT, null); }
+        catch { continue; }
 
-    let tw;
-    try {
-      // filter=null, entityReferenceExpansion=false (ignored)
-      tw = doc.createTreeWalker(r, NodeFilter.SHOW_ELEMENT, null);
-    } catch (e) {
-      // Some nodes (e.g., detached or special fragments) can throw; skip them
-      continue;
+        let n = tw.nextNode();
+        while (n) {
+          yield n;
+          if (n.shadowRoot) stack.push(n.shadowRoot);
+          n = tw.nextNode();
+        }
+      }
     }
 
-    let n = tw.nextNode();
-    while (n) {
-      yield n;
-      // Dive into shadow DOMs
-      if (n.shadowRoot) stack.push(n.shadowRoot);
-      n = tw.nextNode();
+    deepQueryAll(rootNode, selector) {
+      const out = [];
+      for (const el of this.iterAllElementsDeep(rootNode)) {
+        try { if (el.matches && el.matches(selector)) out.push(el); }
+        catch {}
+      }
+      return out;
     }
-  }
-}
-
-deepQueryAll(rootNode, selector) {
-  const out = [];
-  for (const el of this.iterAllElementsDeep(rootNode)) {
-    try {
-      if (el.matches && el.matches(selector)) out.push(el);
-    } catch {
-      // Some elements can throw on matches due to parsing quirks—ignore
-    }
-  }
-  return out;
-}
 
     // ===== Fillable detection =====
     findFillables() {
@@ -232,6 +397,7 @@ deepQueryAll(rootNode, selector) {
 
       const getLabel = (el) => {
         const doc = el.ownerDocument || document;
+        // for/id
         if (el.id) {
           try {
             const lbl = doc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
@@ -241,27 +407,30 @@ deepQueryAll(rootNode, selector) {
             if (lbl?.textContent) return lbl.textContent.trim();
           }
         }
+        // aria-labelledby
         const lbIds = el.getAttribute?.('aria-labelledby');
         if (lbIds) {
           const txt = lbIds.split(/\s+/).map(id => doc.getElementById(id)?.textContent?.trim()).filter(Boolean).join(' ');
           if (txt) return txt;
         }
+        // aria-label
         const aria = el.getAttribute?.('aria-label');
         if (aria) return aria.trim();
+        // placeholder
         if (el.placeholder) return el.placeholder.trim();
+        // fieldset legend
         const fieldset = el.closest?.('fieldset');
         const legend = fieldset?.querySelector?.('legend');
         if (legend?.textContent) return legend.textContent.trim();
-
+        // nearby label-like element
         const prev = el.closest?.('[role="group"], .field, .form-group, .input, .form-item') || el.parentElement;
         if (prev) {
           const maybe = prev.querySelector?.('label, [data-label], [aria-label]');
           const t = maybe?.textContent || maybe?.getAttribute?.('data-label') || maybe?.getAttribute?.('aria-label');
           if (t) return String(t).trim();
         }
-
         if (el.name) return el.name.replace(/[-_]/g, ' ').trim();
-        return 'Unlabeled field';
+        return 'Unlabeled';
       };
 
       const push = (el, kind, roleKind = null, extra = {}) => {
@@ -333,9 +502,9 @@ deepQueryAll(rootNode, selector) {
     // ===== Voice flow =====
     startSpeechRecognition() {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) { this.speak('Speech recognition is not supported in this browser.'); return; }
+      if (!SpeechRecognition) { this.queueSpeak('Speech recognition is not supported in this browser.'); return; }
 
-      if (this.speechRecognition) { try { this.speechRecognition.stop(); } catch {} this.speechRecognition = null; }
+      if (this.rec) { try { this.rec.stop(); } catch {} this.rec = null; }
       const rec = new SpeechRecognition();
       rec.continuous = false;
       rec.interimResults = false;
@@ -345,100 +514,112 @@ deepQueryAll(rootNode, selector) {
         try {
           const t = event?.results?.[0]?.[0]?.transcript || '';
           const text = String(t).toLowerCase().trim();
-          if (!text) this.speak('Sorry, I didn’t catch that. Please try again.');
+          if (!text) this.queueSpeak('Sorry, I didn’t catch that. Please try again.');
           else this.handleUserInput(text);
         } catch {
-          this.speak('Sorry, I didn’t catch that. Please try again.');
+          this.queueSpeak('Sorry, I didn’t catch that. Please try again.');
         }
       };
 
-      rec.onerror = () => { if (this.isActive) this.speak('Sorry, I didn’t catch that. Please try again.'); };
-      rec.onend = () => { if (this.isActive) setTimeout(() => this.startSpeechRecognition(), 200); };
-      this.speechRecognition = rec;
+      rec.onerror = () => { if (this.isActive) this.queueSpeak('Sorry, I didn’t catch that. Please try again.'); };
+      rec.onend = () => { if (this.isActive) setTimeout(() => this.startSpeechRecognition(), 250); };
+      this.rec = rec;
       try { rec.start(); } catch {}
     }
 
-    stopSpeechRecognition() { if (this.speechRecognition) { try { this.speechRecognition.stop(); } catch {} this.speechRecognition = null; } }
+    stopSpeechRecognition() { if (this.rec) { try { this.rec.stop(); } catch {} this.rec = null; } }
 
     handleUserInput(transcript) {
-      if (transcript.includes('summary') || transcript.includes('summarize')) {
-        this.provideSummaryLLM();
-        return;
-      }
-      if (transcript.includes('fill') || transcript.includes('blank') || transcript.includes('form')) {
-        this.summarizeFillablesThenAsk();
-        return;
-      }
-      if (transcript === 'yes' || transcript.startsWith('yes ')) {
-        this.summarizeFillablesThenAsk();
-        return;
-      }
-      if (transcript === 'no' || transcript.startsWith('no ')) {
-        this.speak('Okay. Say "summary" or "fill the form" anytime.');
-        return;
+      const t = transcript.toLowerCase();
+
+      if (t.includes('summary') || t.includes('overview') || t.includes('describe page')) {
+        this.providePageOverview(); return;
       }
 
+      if (t.includes('fill') || t.includes('blank') || t.includes('form') || t.includes('complete')) {
+        this.runFillInTheBlanksFlow(); return;
+      }
+
+      if (t === 'yes' || t.startsWith('yes ')) { this.runFillInTheBlanksFlow(); return; }
+      if (t === 'no'  || t.startsWith('no '))  { this.queueSpeak('Okay. Say "summary" for an overview or "fill the form" anytime.'); return; }
+
       if (this.selectedFields.length > 0 && this.currentFieldIndex < this.selectedFields.length) {
+        if (t === 'repeat') { this.readCurrentField(); return; }
+        if (t === 'skip')   { this.nextField(); return; }
+        if (t === 'back')   { this.prevField(); return; }
+        if (t === 'cancel') { this.cancelFieldFilling(); return; }
         this.handleFieldValue(transcript);
         return;
       }
 
-      const m = transcript.match(/\bfield\s*(\d+)\b/);
+      const m = t.match(/\bfield\s*(\d+)\b/);
       if (m) {
         const idx = parseInt(m[1], 10) - 1;
         if (!Number.isNaN(idx) && idx >= 0 && idx < this.formFields.length) {
-          this.selectedFields = [this.formFields[idx]];
-          this.currentFieldIndex = 0;
-          this.speak(`Selected ${this.formFields[idx].label}. What would you like to enter?`);
-          return;
+          this.selectFieldByIndex(idx); return;
         }
       }
 
-      const match = this.formFields.find(f => f.label && transcript.includes(f.label.toLowerCase().split(/\s+/)[0]));
-      if (match) {
-        this.selectedFields = [match];
-        this.currentFieldIndex = 0;
-        this.speak(`Selected ${match.label}. What would you like to enter?`);
-        return;
-      }
+      const match = this.formFields.find(f => f.label && t.includes(f.label.toLowerCase().split(/\s+/)[0]));
+      if (match) { this.selectField(match); return; }
 
-      this.speak('Say "summary" for a page summary or "fill the form" to fill blanks. You can also say "field 1", "field 2", or a field name.');
+      this.queueSpeak('Say "summary" for a page overview or "fill the form" to list blanks. You can also say "field 1" or a field name.');
     }
 
-    summarizeFillablesThenAsk() {
-      if (this.formFields.length === 0) {
-        this.speak('I don’t see any fillable fields on this page.');
-        return;
+    // ===== Field selection helpers =====
+    selectFieldByIndex(idx) {
+      if (Number.isNaN(idx) || idx < 0 || idx >= this.formFields.length) {
+        this.queueSpeak('That number is out of range. Try again.'); return;
       }
-      const parts = this.formFields.slice(0, 15).map((f, i) => {
-        const req = f.required ? 'required' : 'optional';
-        const type = f.kind || f.roleKind || 'field';
-        return `${i+1}. ${f.label} — ${type}, ${req}`;
-      });
-      const tail = this.formFields.length > 15 ? `...and ${this.formFields.length - 15} more.` : '';
-      this.speak(`I found ${this.formFields.length} fillable items. ${parts.join('. ')}. ${tail} Say a number like "field 1" or say the field name to select.`);
+      this.selectField(this.formFields[idx]);
     }
 
-    handleFieldValue(valueTranscript) {
+    selectField(field) {
+      this.selectedFields = [field];
+      this.currentFieldIndex = 0;
+      this.readCurrentField();
+    }
+
+    readCurrentField() {
       if (this.currentFieldIndex >= this.selectedFields.length) return;
-
       const field = this.selectedFields[this.currentFieldIndex];
-      const filled = this.tryFillField(field, valueTranscript);
+      const req = field.required ? 'required' : 'optional';
+      const type = field.kind || field.roleKind || 'field';
+      this.queueSpeak(`Selected: ${field.label || 'Unlabeled'} — ${type}, ${req}. What would you like me to enter? You can say repeat, skip, back, or cancel.`);
+    }
 
-      if (!filled) {
-        this.speak(`I could not fill ${field.label}. You can try rephrasing or choose another field.`);
-        return;
-      }
-
+    nextField() {
       this.currentFieldIndex++;
       if (this.currentFieldIndex < this.selectedFields.length) {
-        const nextField = this.selectedFields[this.currentFieldIndex];
-        this.speak(`Next field: ${nextField.label}. What would you like to enter?`);
+        this.readCurrentField();
       } else {
-        this.speak('All selected fields have been filled. Do you need help with anything else?');
+        this.queueSpeak('All selected fields have been handled. Do you want to fill another field? Say a number like "field 2", a field name, or say "summary".');
         this.selectedFields = [];
         this.currentFieldIndex = 0;
       }
+    }
+
+    prevField() {
+      if (this.currentFieldIndex > 0) this.currentFieldIndex--;
+      this.readCurrentField();
+    }
+
+    cancelFieldFilling() {
+      this.selectedFields = [];
+      this.currentFieldIndex = 0;
+      this.queueSpeak('Canceled filling. Say "fill the form" to hear blanks again or "summary" for a page overview.');
+    }
+
+    // ===== Field value handling =====
+    handleFieldValue(valueTranscript) {
+      if (this.currentFieldIndex >= this.selectedFields.length) return;
+      const field = this.selectedFields[this.currentFieldIndex];
+      const filled = this.tryFillField(field, valueTranscript);
+      if (!filled) {
+        this.queueSpeak(`I could not fill ${field.label}. You can try rephrasing or choose another field.`);
+        return;
+      }
+      this.nextField();
     }
 
     tryFillField(field, value) {
@@ -454,40 +635,34 @@ deepQueryAll(rootNode, selector) {
 
         if (kind === 'select') {
           const sel = el;
-          const lower = value.toLowerCase();
+          const lower = String(value).toLowerCase();
           let matched = false;
           for (const opt of sel.options) {
-            if ((opt.textContent || '').trim().toLowerCase() === lower) {
-              sel.value = opt.value;
-              matched = true;
-              break;
-            }
+            const txt = (opt.textContent || '').trim().toLowerCase();
+            if (txt === lower) { sel.value = opt.value; matched = true; break; }
           }
           if (!matched) {
             for (const opt of sel.options) {
-              if ((opt.textContent || '').toLowerCase().includes(lower)) {
-                sel.value = opt.value;
-                matched = true;
-                break;
-              }
+              const txt = (opt.textContent || '').trim().toLowerCase();
+              if (txt.includes(lower)) { sel.value = opt.value; matched = true; break; }
             }
           }
           if (matched) {
             sel.dispatchEvent(new Event('input', { bubbles: true }));
             sel.dispatchEvent(new Event('change', { bubbles: true }));
-            this.speak(`Set ${field.label} to ${value}.`);
+            this.queueSpeak(`Set ${field.label} to ${value}.`);
             return true;
           }
           return false;
         }
 
         if (kind === 'checkbox') {
-          const v = value.trim().toLowerCase();
+          const v = String(value).trim().toLowerCase();
           const on = v === 'yes' || v === 'check' || v === 'true' || v === 'on' || v === 'enable';
           el.checked = on;
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
-          this.speak(`${on ? 'Checked' : 'Unchecked'} ${field.label}.`);
+          this.queueSpeak(`${on ? 'Checked' : 'Unchecked'} ${field.label}.`);
           return true;
         }
 
@@ -496,7 +671,7 @@ deepQueryAll(rootNode, selector) {
           if (!name) return false;
           const doc = el.ownerDocument || document;
           const radios = doc.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
-          const lower = value.toLowerCase();
+          const lower = String(value).toLowerCase();
           for (const r of radios) {
             let lbl = '';
             if (r.id) {
@@ -518,7 +693,7 @@ deepQueryAll(rootNode, selector) {
               r.checked = true;
               r.dispatchEvent(new Event('input', { bubbles: true }));
               r.dispatchEvent(new Event('change', { bubbles: true }));
-              this.speak(`Selected ${lbl ? lbl : r.value} for ${field.label}.`);
+              this.queueSpeak(`Selected ${lbl ? lbl : r.value} for ${field.label}.`);
               return true;
             }
           }
@@ -527,7 +702,7 @@ deepQueryAll(rootNode, selector) {
 
         if (kind === 'pickerButton') {
           el.click();
-          this.speak(`Opened ${field.label}. Use the site’s picker, or say another field.`);
+          this.queueSpeak(`Opened ${field.label}. Use the site’s picker, or say another field.`);
           return true;
         }
 
@@ -535,7 +710,7 @@ deepQueryAll(rootNode, selector) {
           el.value = value;
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
-          this.speak(`Set ${field.label} to ${value}.`);
+          this.queueSpeak(`Set ${field.label} to ${value}.`);
           return true;
         }
 
@@ -543,7 +718,7 @@ deepQueryAll(rootNode, selector) {
           el.value = value;
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
-          this.speak(`Entered ${value} for ${field.label}.`);
+          this.queueSpeak(`Entered ${value} for ${field.label}.`);
           return true;
         }
 
@@ -551,14 +726,15 @@ deepQueryAll(rootNode, selector) {
           el.innerText = value;
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
-          this.speak(`Entered ${value} for ${field.label}.`);
+          this.queueSpeak(`Entered ${value} for ${field.label}.`);
           return true;
         }
 
+        // Default text-like
         el.value = value;
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
-        this.speak(`Entered ${value} for ${field.label}.`);
+        this.queueSpeak(`Entered ${value} for ${field.label}.`);
         return true;
 
       } catch (err) {
@@ -569,24 +745,11 @@ deepQueryAll(rootNode, selector) {
       }
     }
 
-    // ===== TTS =====
-    speak(text) {
-      if (!this.isActive) return;
-      this.stopSpeechSynthesis();
-      const u = new SpeechSynthesisUtterance(text);
-      u.volume = this.settings.volume;
-      u.rate   = this.settings.speechRate;
-      u.lang   = 'en-US';
-      try { this.speechSynthesis.speak(u); } catch {}
-    }
-    stopSpeechSynthesis() { try { this.speechSynthesis.cancel(); } catch {} }
-
     updateStatus(message) {
       try { chrome.runtime.sendMessage({ type: 'statusUpdate', text: message }); } catch {}
     }
   }
 
-  // One instance per frame
   (function bootstrap() {
     if (!window.accessibilityAssistant) {
       window.accessibilityAssistant = new AccessibilityAssistant();

@@ -44,15 +44,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'summarizePage') {
     (async () => {
       try {
-        const { payload } = msg;
-        const cacheKey = (payload?.url || '') + '|' + (payload?.title || '');
+        const { payload, mode = 'overview' } = msg; // 'overview' | 'fillables'
+        const cacheKey = JSON.stringify({ u: payload?.url || '', t: payload?.title || '', mode, sig: payload?.cacheSig || 0 });
         const cached = summaryCache.get(cacheKey);
         if (cached && (Date.now() - cached.t) < 2 * 60 * 1000) {
           sendResponse({ ok: true, summary: cached.summary, cached: true });
           return;
         }
-
-        const summary = await summarizeWithOpenAI(payload);
+        const summary = await summarizeWithOpenAI(payload, mode);
         summaryCache.set(cacheKey, { summary, t: Date.now() });
         sendResponse({ ok: true, summary });
       } catch (e) {
@@ -82,19 +81,35 @@ function chunkText(str, chunkSize = 3500, maxChunks = 4) {
   return chunks.slice(0, maxChunks);
 }
 
-async function summarizeWithOpenAI(payload) {
+async function summarizeWithOpenAI(payload, mode = 'overview') {
   const apiKey = await getOpenAIKey();
   if (!apiKey) throw new Error('Missing OpenAI API key in storage');
 
-  const { url, title, headings = [], landmarks = [], interactiveCounts = {}, text = '' } = payload;
+  const {
+    url, title, headings = [], landmarks = [], interactiveCounts = {}, text = '',
+    // New for fillables
+    fillableLabels = [],
+    fillableContext = null,
+  } = payload;
+
   const chunks = chunkText(text);
 
-  const system = `You are an accessibility assistant summarizing web pages for low-vision users.
-- Be concise and action-oriented.
-- Focus on what the user can do here (primary tasks, search, filters, forms, pickers).
-- Prefer 4–8 bullet points; short lines.
-- If there are inputs/pickers, list what needs to be filled/selected.
-- Avoid brand fluff; maximize task clarity.`;
+  const SYSTEMS = {
+    overview: `You are an accessibility assistant producing a neutral overview for low-vision users.
+- Summarize the page content in 3–6 concise sentences.
+- Do not give instructions or checklists.
+- Avoid brand hype; stay factual and plain-language.`,
+
+    // Natural, labels-only, context-aware list (no types or required flags)
+    fillables: `You are an accessibility assistant helping a low-vision user understand what the page asks them to fill.
+- Rewrite the provided field labels into a numbered list (1., 2., 3., ...).
+- Make each item short, natural, and contextual: add generic prepositions using page context (e.g., "Dates of travel", "Number of travelers", "Shipping address").
+- DO NOT include field types, "required/optional", examples, or extra steps.
+- Keep between 3 and 12 bullets when possible; preserve perceived importance (location/search terms first, then dates/times, then counts/people, then options).
+- Output ONLY the numbered list, no preface or epilogue.`
+  };
+
+  const system = SYSTEMS[mode] || SYSTEMS.overview;
 
   const meta = [
     `URL: ${url}`,
@@ -104,32 +119,49 @@ async function summarizeWithOpenAI(payload) {
     landmarks.length ? `Landmarks: ${landmarks.join(', ')}` : ''
   ].filter(Boolean).join('\n');
 
-  const messages = [
-    { role: 'system', content: system },
-    { role: 'user', content: meta }
-  ];
+  const messages = [{ role: 'system', content: system }, { role: 'user', content: meta }];
 
-  chunks.forEach((c, i) => {
-    messages.push({ role: 'user', content: `CONTENT CHUNK ${i+1}/${chunks.length}:\n${c}` });
-  });
+  if (mode === 'overview') {
+    chunks.forEach((c, i) => messages.push({ role: 'user', content: `CONTENT CHUNK ${i+1}/${chunks.length}:\n${c}` }));
+  } else if (mode === 'fillables') {
+    const labelBlock = (fillableLabels || []).slice(0, 100).map((l, i) => `${i + 1}. ${l || 'Unlabeled'}`).join('\n');
+    messages.push({ role: 'user', content: `FIELD LABELS:\n${labelBlock}` });
+
+    if (fillableContext) {
+      messages.push({
+        role: 'user',
+        content:
+`PAGE CONTEXT:
+Title: ${fillableContext.title || '(none)'}
+Headings: ${Array.isArray(fillableContext.headings) ? fillableContext.headings.join(' | ') : ''}
+URL hints: ${fillableContext.urlHints || ''}
+Global hints: ${fillableContext.globalKeywords || ''}
+
+PER-FIELD HINTS (labels, placeholders, surrounding phrases):
+${(fillableContext.fields || []).slice(0, 50).map((f, i) => {
+  const hints = [
+    f.label && `label="${f.label}"`,
+    f.placeholder && `placeholder="${f.placeholder}"`,
+    f.name && `name="${f.name}"`,
+    f.ariaLabel && `aria="${f.ariaLabel}"`,
+    f.group && `group="${f.group}"`,
+    f.nearby && `nearby="${f.nearby}"`,
+  ].filter(Boolean).join(', ');
+  return `#${i+1}: ${hints}`;
+}).join('\n')}
+`
+      });
+    }
+  }
 
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      max_tokens: 350,
-      messages
-    })
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.2, max_tokens: 350, messages })
   });
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
-    console.error('[AA] OpenAI error body:', txt);
     throw new Error(`OpenAI ${resp.status}: ${txt.slice(0, 500)}`);
   }
 
