@@ -13,7 +13,10 @@
     const keyInput = document.getElementById('openaiKey');
     const saveKey  = document.getElementById('saveKey');
 
-    function setStatus(text) { if (statusEl) statusEl.textContent = text; }
+    function setStatus(text) {
+      if (statusEl) statusEl.textContent = text;
+    }
+
     function setButtons(active) {
       if (startBtn) startBtn.disabled = active;
       if (stopBtn)  stopBtn.disabled  = !active;
@@ -27,11 +30,13 @@
 
     function isRestricted(url) {
       if (!url) return true;
-      return url.startsWith('chrome://') ||
-             url.startsWith('edge://') ||
-             url.startsWith('about:') ||
-             url.includes('chrome.google.com/webstore') ||
-             url.endsWith('.pdf');
+      return (
+        url.startsWith('chrome://') ||
+        url.startsWith('edge://') ||
+        url.startsWith('about:') ||
+        url.includes('chrome.google.com/webstore') ||
+        url.endsWith('.pdf')
+      );
     }
 
     async function pingOnce(tabId) {
@@ -43,16 +48,15 @@
       }
     }
 
-    // NEW: last-chance injector (no `allFrames`)
+    // last-chance injector (fixed: allFrames belongs in target)
     async function ensureReachable(tabId) {
       // 1) quick ping
       if (await pingOnce(tabId)) return true;
 
-      // 2) programmatic inject (only main frame)
+      // 2) programmatic inject
       try {
         await chrome.scripting.executeScript({
-          target: { tabId },
-          world: 'ISOLATED',
+          target: { tabId, allFrames: true },
           files: ['content.js']
         });
       } catch (e) {
@@ -62,7 +66,7 @@
       // 3) ping again a few times
       for (let i = 0; i < 8; i++) {
         if (await pingOnce(tabId)) return true;
-        await new Promise(r => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, 150));
       }
       return false;
     }
@@ -72,13 +76,17 @@
       try {
         const tab = await getActiveTab();
         if (isRestricted(tab.url || '')) {
-          throw new Error('Open a normal website (http/https). PDFs, Chrome Web Store, and chrome:// pages are restricted.');
+          throw new Error(
+            'Open a normal website (http/https). PDFs, Chrome Web Store, and chrome:// pages are restricted.'
+          );
         }
 
         setStatus('Connecting…');
         const ok = await ensureReachable(tab.id);
         if (!ok) {
-          throw new Error('Could not reach content script.\n\nTry this:\n• Refresh the page (hard refresh).\n• If it’s a file:// page, enable “Allow access to file URLs” in the extension’s Details.\n• Make sure the extension is allowed on this site (chrome://extensions → your extension → Site access: On all sites).\n• Not incognito? If incognito, enable “Allow in incognito”.');
+          throw new Error(
+            'Could not reach content script.\n\nTry this:\n• Refresh the page (hard refresh).\n• If it’s a file:// page, enable “Allow access to file URLs” in the extension’s Details.\n• Make sure the extension is allowed on this site (chrome://extensions → your extension → Site access: On all sites).\n• If incognito, enable “Allow in incognito”.'
+          );
         }
 
         await chrome.tabs.sendMessage(tab.id, { action: 'startAssistant' });
@@ -94,7 +102,9 @@
     stopBtn?.addEventListener('click', async () => {
       try {
         const tab = await getActiveTab();
-        try { await chrome.tabs.sendMessage(tab.id, { action: 'stopAssistant' }); } catch {}
+        try {
+          await chrome.tabs.sendMessage(tab.id, { action: 'stopAssistant' });
+        } catch {}
         setButtons(false);
         setStatus('Assistant stopped');
         if (currentActionEl) currentActionEl.textContent = '';
@@ -104,11 +114,54 @@
       }
     });
 
+    // === Spacebar in popup ONLY ===
+    document.addEventListener('keydown', (e) => {
+      // only space
+      if (e.code !== 'Space' && e.key !== ' ') return;
+
+      // don't hijack when typing API key
+      const tgt = e.target;
+      if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) {
+        return;
+      }
+
+      e.preventDefault();
+
+      // if focus is on start or stop, just click that
+      if (document.activeElement === startBtn) {
+        startBtn.click();
+        return;
+      }
+      if (document.activeElement === stopBtn) {
+        stopBtn.click();
+        return;
+      }
+
+      // otherwise: if start is enabled, start; else stop
+      if (!startBtn.disabled) {
+        startBtn.click();
+      } else {
+        stopBtn.click();
+      }
+    });
+
     // Volume/speed controls
-    volumeUp?.addEventListener('click', () => { chrome.storage.local.set({ volume: 1.0 }); setStatus('Volume: max'); });
-    volumeDown?.addEventListener('click', () => { chrome.storage.local.set({ volume: 0.5 }); setStatus('Volume: medium'); });
-    speedUp?.addEventListener('click', () => { chrome.storage.local.set({ speechRate: 1.5 }); setStatus('Speech speed increased'); });
-    speedDown?.addEventListener('click', () => { chrome.storage.local.set({ speechRate: 0.8 }); setStatus('Speech speed decreased'); });
+    volumeUp?.addEventListener('click', () => {
+      chrome.storage.local.set({ volume: 1.0 });
+      setStatus('Volume: max');
+    });
+    volumeDown?.addEventListener('click', () => {
+      chrome.storage.local.set({ volume: 0.5 });
+      setStatus('Volume: medium');
+    });
+    speedUp?.addEventListener('click', () => {
+      chrome.storage.local.set({ speechRate: 1.5 });
+      setStatus('Speech speed increased');
+    });
+    speedDown?.addEventListener('click', () => {
+      chrome.storage.local.set({ speechRate: 0.8 });
+      setStatus('Speech speed decreased');
+    });
 
     // Status updates from content
     chrome.runtime.onMessage.addListener((message) => {
